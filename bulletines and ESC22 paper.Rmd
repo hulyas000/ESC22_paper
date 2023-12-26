@@ -1,0 +1,747 @@
+---
+title: "bulletines and ESC22 paper"
+output: html_notebook
+---
+
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(forecast)
+library(lubridate)
+library(ggplot2)
+library(viridis)
+library(patchwork)
+library(scales)
+library(tidyr)
+library(purrr)
+
+all_years_data <- sub_data_agg_full_df %>% 
+  group_by(crime_type, month = as.Date(paste0(month, "-01"))) %>%
+  summarise(crime_count = sum(crime_count))
+
+# Filter rows for 05.2023 and 06.2023 from all_years_data
+update <- all_years_data %>%
+  filter(month %in% as.Date(c("2023-05-01", "2023-06-01")))
+
+# Combine the new_data with all_data_combined
+all_data_combined <- all_data_combined %>% 
+  select(-crime_rates)
+
+all_years_data <- bind_rows(all_years_data, all_data_combined)
+
+all_years_data$crime_rates <- all_years_data$crime_count/pop_ests$pop
+
+# Filter data for the training period
+histrocal_data <- all_years_data %>%
+  filter(month >= ymd("2015-03-01"), month <= ymd("2020-02-01"))
+
+# Filter data for the forecast period
+pandemic_data <- all_years_data %>%
+  filter(month >= ymd("2020-03-01"), month <= ymd("2023-08-01"))
+
+# Run ARIMA model for each crime type
+results <- lapply(unique(all_years_data$crime_type), function(crime) {
+  crime_data_his <- filter(histrocal_data, crime_type == crime)
+  
+  count_ts = ts(crime_data_his$crime_rates, frequency=12)
+
+  # Train auto.arima model
+  fitARIMA <- auto.arima(count_ts, trace=FALSE,
+                         stepwise = FALSE, approximation = FALSE)
+
+  # Forecast for the test period
+  forecasted <- forecast(fitARIMA, h = 42, level=c(95.0))
+
+  # Filter pandemic data for the same crime type
+  crime_data_pandemic <- filter(pandemic_data, crime_type == crime)
+
+  # Calculate percentage difference between crime rates and predicted values
+  perc_change <- as.vector(100 * (crime_data_pandemic$crime_rates-forecasted$mean)/forecasted$mean)
+   perc_change_upper <- as.vector(100 * ((forecasted$upper-crime_data_pandemic$crime_rates)/crime_data_pandemic$crime_rates))
+   perc_change_lower <- as.vector(100 * ((forecasted$lower/crime_data_pandemic$crime_rates)/crime_data_pandemic$crime_rates))
+   
+  data.frame(
+     crime_type = crime,
+     crime_rates = crime_data_pandemic$crime_rates,
+     month = crime_data_pandemic$month,
+     fitted = as.vector(forecasted$mean),
+     lower_95 = as.vector(forecasted$lower),
+     upper_95 = as.vector(forecasted$upper),
+     perc_change = perc_change,
+     perc_change_upper = perc_change_upper,
+     perc_change_lower = perc_change_lower
+  )
+})
+
+
+# Combine results into a single data frame
+results_df <- bind_rows(results)
+
+# Assuming 'results_df' has a column named 'fitted' that you want to save along with 'crime_type', 'crime_rate', and 'month'
+selected_df <- results_df[, c("crime_type", "month", "crime_rates", "fitted", "perc_change")]
+
+# Now, write this new data frame to a CSV file
+write.csv(selected_df, "selected_data.csv", row.names = FALSE)
+
+
+```
+
+#Average percentage differences for crime types
+```{r}
+# Create a period identifier based on the month and year
+results_df <- results_df %>%
+  mutate(period = case_when(
+    month >= as.Date("2020-03-01") & month < as.Date("2021-03-01") ~ "1st Year",
+    month >= as.Date("2021-03-01") & month < as.Date("2022-03-01") ~ "2nd Year",
+    month >= as.Date("2022-03-01") & month < as.Date("2023-03-01") ~ "3rd Year",
+    month >= as.Date("2023-03-01") & month <= as.Date("2023-08-01") ~ "4th Period"
+  ))
+
+# Calculate the average percentage change for each crime type in each period
+average_percentage_diff <- results_df %>%
+  group_by(crime_type, period) %>%
+  summarise(avg_perc_change = mean(perc_change, na.rm = TRUE)) %>%
+  ungroup()
+
+# View the average percentage difference
+print(average_percentage_diff)
+
+# Save the average percentage difference to a CSV file
+write.csv(average_percentage_diff, "average_percentage_difference.csv", row.names = FALSE)
+```
+
+```{r}
+results_df <- results_df %>%  mutate(nice_crime_names = recode(crime_type, "Anti-social behaviour" = 'ASB',
+                                  "Bicycle theft"  = 'Bike Theft',
+                                  "Criminal damage and arson"  = 'Damage & Arson',
+                                  "Other crime" = 'Other Crime',
+                                  "Other theft"= 'Other Theft',
+                                  "Possession of weapons" = 'Weapon Possession',
+                                  "Public order"  = 'Public Order',
+                                  "Theft from the person" = 'Theft Person',
+                                  "Violence and sexual offences"= 'Violence & Sex Offences',
+                                  'Vehicle crime' = 'Vehicle Crime',.default = crime_type ))
+```
+
+#required df.s for paper panels
+```{r}
+panel_1_crimes <- c("Theft from the person", "Robbery", "Shoplifting", 
+                    "Other theft", "Burglary", "Vehicle crime", "Criminal damage and arson", 
+                    "Bicycle theft")
+
+# Panel 1 crimes for arima plots
+panel_1_df <- results_df[results_df$crime_type %in% panel_1_crimes, ]
+
+# For Panel 2, take the ones not in Panel 1
+panel_2_df <- results_df[!results_df$crime_type %in% panel_1_crimes, ]
+
+# Trend 1 crime for first parts
+trend_1_df <- all_years_data[all_years_data$crime_type %in% panel_1_crimes, ]
+trend_2_df <- all_years_data[!all_years_data$crime_type %in% panel_1_crimes, ]
+
+unique(panel_1_df$crime_type)
+unique(panel_2_df$crime_type)
+unique(trend_1_df$crime_type)
+unique(trend_2_df$crime_type)
+```
+
+```{r}
+panel_1_df <- panel_1_df %>%
+  mutate(nice_crime_names_arima = recode(crime_type,
+    "Theft from the person" = 'Theft Person (1,0,0)(1,1,0)',
+    "Robbery" = "Robbery (0,1,1)(1,0,0)",
+    "Shoplifting" = "Shoplifting (2,1,0)(1,1,0)",
+    "Other theft" = 'Other Theft (3,1,0)(1,1,0)',
+    "Vehicle crime" = 'Vehicle Crime (1,1,0)(1,1,0)',
+    "Criminal damage and arson" = 'Damage & Arson (0,1,1)(0,1,1)',
+    "Bicycle theft" = 'Bike Theft (0,1,0)(0,1,1)',
+    "Burglary" = "Burglary (0,1,1)(1,1,0)",
+    .default = crime_type
+  ))
+
+desired_order <- c('Theft Person (1,0,0)(1,1,0)', "Robbery (0,1,1)(1,0,0)", "Shoplifting (2,1,0)(1,1,0)", 'Other Theft (3,1,0)(1,1,0)', "Burglary (0,1,1)(1,1,0)", 'Vehicle Crime (1,1,0)(1,1,0)', 'Damage & Arson (0,1,1)(0,1,1)', "Bike Theft (0,1,0)(0,1,1)")
+                   
+panel_1_df$nice_crime_names_arima <- factor(panel_1_df$nice_crime_names_arima, levels = desired_order)
+
+panel_1_df <- panel_1_df %>%
+  mutate(nice_crime_names = recode(crime_type,
+    "Theft from the person" = 'Theft Person',
+    "Robbery" = "Robbery",
+    "Shoplifting" = "Shoplifting",
+    "Other theft" = 'Other Theft',
+    "Vehicle crime" = 'Vehicle Crime',
+    "Criminal damage and arson" = 'Damage & Arson',
+    "Bicycle theft" = 'Bike Theft',
+    "Burglary" = "Burglary",
+    .default = crime_type
+  ))
+desired_order <- c('Theft Person', "Robbery", "Shoplifting", 'Other Theft', "Burglary", 'Vehicle Crime', 'Damage & Arson', "Bike Theft")
+                   
+panel_1_df$nice_crime_names <- factor(panel_1_df$nice_crime_names, levels = desired_order)
+
+
+panel_2_df <- panel_2_df %>%
+  mutate(nice_crime_names_arima = recode(crime_type,
+    "Anti-social behaviour" = 'ASB (1,1,0)(1,1,0)',
+    "Drugs" = "Drugs (0,1,2)(1,0,0)",
+    "Other crime" = 'Other Crime (0,1,1)(0,1,1)',
+    "Possession of weapons" = 'Weapon Possession (0,1,1)(1,1,0)',
+    "Public order" = 'Public Order (0,1,0)(0,1,1)',
+    "Violence and sexual offences" = 'Violence & Sex Offences (1,0,0)(0,1,1) with drift',
+    .default = crime_type  
+  ))
+
+desired_order_2 <- c('Violence & Sex Offences (1,0,0)(0,1,1) with drift',"Public Order (0,1,0)(0,1,1)", "Weapon Possession (0,1,1)(1,1,0)","ASB (1,1,0)(1,1,0)","Drugs (0,1,2)(1,0,0)", "Other Crime (0,1,1)(0,1,1)")
+
+panel_2_df$nice_crime_names_arima <- factor(panel_2_df$nice_crime_names_arima, levels = desired_order_2)
+
+panel_2_df <- panel_2_df %>%
+  mutate(nice_crime_names = recode(crime_type,
+    "Anti-social behaviour" = 'ASB',
+    "Drugs" = "Drugs",
+    "Other crime" = 'Other Crime',
+    "Possession of weapons" = 'Weapon Possession',
+    "Public order" = 'Public Order',
+    "Violence and sexual offences" = 'Violence & Sex Offences',
+    .default = crime_type  
+  ))
+
+desired_order_2 <- c('Violence & Sex Offences',"Public Order", "Weapon Possession","ASB","Drugs", "Other Crime")
+
+panel_2_df$nice_crime_names <- factor(panel_2_df$nice_crime_names, levels = desired_order_2)
+
+# same for trend df.s
+
+trend_1_df <- trend_1_df %>%
+  mutate(nice_crime_names = recode(crime_type,
+    "Theft from the person" = 'Theft Person',
+    "Robbery" = "Robbery",
+    "Shoplifting" = "Shoplifting",
+    "Other theft" = 'Other Theft',
+    "Vehicle crime" = 'Vehicle Crime',
+    "Criminal damage and arson" = 'Damage & Arson',
+    "Bicycle theft" = 'Bike Theft',
+    "Burglary" = "Burglary",
+    .default = crime_type
+  ))
+desired_order <- c('Theft Person', "Robbery", "Shoplifting", 'Other Theft', "Burglary", 'Vehicle Crime', 'Damage & Arson', "Bike Theft")
+                   
+trend_1_df$nice_crime_names <- factor(trend_1_df$nice_crime_names, levels = desired_order)
+
+#trend 2
+
+trend_2_df <- trend_2_df %>%
+  mutate(nice_crime_names = recode(crime_type,
+    "Anti-social behaviour" = 'ASB',
+    "Drugs" = "Drugs",
+    "Other crime" = 'Other Crime',
+    "Possession of weapons" = 'Weapon Possession',
+    "Public order" = 'Public Order',
+    "Violence and sexual offences" = 'Violence & Sex Offences',
+    .default = crime_type  
+  ))
+
+desired_order_2 <- c('Violence & Sex Offences',"Public Order", "Weapon Possession","ASB","Drugs", "Other Crime")
+
+trend_2_df$nice_crime_names <- factor(trend_2_df$nice_crime_names, levels = desired_order_2)
+
+```
+
+
+#panels are for short med long term article. both arima and pd panels are divided into two to provide better visualization
+```{r}
+# Create a dataframe for lockdown periods
+lockdown_periods <- data.frame(
+  start = as.Date(c("2020-03-26", "2020-11-05", "2021-01-06")),
+  end = as.Date(c("2020-06-01", "2020-12-02", "2021-03-10"))
+)
+date_breaks <- seq(from = as.Date("2020-03-01"), 
+                   to = max(results_df$month), 
+                   by = "4 months")
+
+vertical_lines_df <- data.frame(
+  dates = as.Date(c("2020-03-26", "2021-03-26", "2022-03-26", "2023-03-26"))
+)
+
+panel_1 <- ggplot(data = panel_1_df, aes(x = month, y = crime_rates, group = nice_crime_names)) +
+  geom_line(colour = '#21918c', size = 2) +
+  geom_line(aes(y = fitted), linetype = 'dashed', size = 1) +
+  geom_vline(data = vertical_lines_df, aes(xintercept = dates), colour = "gray25", linetype = "solid", size = 0.8) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95), alpha = 0.1) +
+  facet_wrap(~nice_crime_names, scales = "free_y", ncol = 2)+
+  theme_bw() +
+  geom_rect(data = lockdown_periods, aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+            fill = "grey65", alpha = 0.4, inherit.aes = FALSE) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 28),  
+        axis.text.y = element_text(size = 28),
+        strip.background = element_blank(), 
+    strip.text = element_text(face = 'bold', size = 32),
+    panel.spacing.x = unit(0.5, "lines"), 
+    panel.spacing.y = unit(0.5, "lines"), 
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "cm")) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6)) +
+  scale_x_date(breaks = date_breaks, date_labels = "%b %y", 
+               limits = c(as.Date("2020-03-01"), max(panel_1_df$month)), 
+               expand = c(0.01, 0.01)) +
+  labs(y = '', x = '')
+  
+
+ggsave(filename = 'visuals/panel_1_gg.png', panel_1, width = 17, height = 23)
+
+#panel 2
+
+panel_2 <- ggplot(data = panel_2_df, aes(x = month, y = crime_rates, group = nice_crime_names)) +
+  geom_line(colour = '#21918c', size = 2) +
+  geom_line(aes(y = fitted), linetype = 'dashed', size = 1) +
+    geom_vline(data = vertical_lines_df, aes(xintercept = dates), colour = "gray25", linetype = "solid", size = 0.8) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95), alpha = 0.1) +
+  theme_bw() +
+  geom_rect(data = lockdown_periods, aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+            fill = "grey65", alpha = 0.4, inherit.aes = FALSE) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 28),  
+        axis.text.y = element_text(size = 28),
+        strip.background = element_blank(), 
+    strip.text = element_text(face = 'bold', size = 32),
+    panel.spacing.x = unit(0.5, "lines"), 
+    panel.spacing.y = unit(0.5, "lines"), 
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "cm")) +
+  scale_x_date(breaks = date_breaks, date_labels = "%b %y", 
+               limits = c(as.Date("2020-03-01"), max(panel_1_df$month)), 
+               expand = c(0.01, 0.01)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6)) +
+  labs(y = '', x = '') +
+  facet_wrap(~nice_crime_names, scales = 'free_y', ncol = 2)
+    
+ggsave(filename = 'visuals/panel_2_gg.png', panel_2, width = 17, height = 23)
+
+```
+
+
+```{r}
+
+panel_3= ggplot(data = panel_1_df, aes(x = month, y = perc_change, group = nice_crime_names))+
+  geom_line(colour = "#440154", size = 2)+
+  #geom_ribbon(aes(ymin = perc_change_lower, ymax = perc_change_upper),alpha = 0.2)+
+    geom_vline(data = vertical_lines_df, aes(xintercept = dates), colour = "gray25", linetype = "solid", size = 0.8) +
+  scale_x_date(breaks = date_breaks, date_labels = "%b %y", 
+               limits = c(as.Date("2020-03-01"), max(results_df$month)), 
+               expand = c(0.01, 0.01)) +
+  geom_rect(data=lockdown_periods, aes(xmin=start, xmax=end, ymin=-Inf, ymax=Inf), 
+            fill="grey65", alpha=0.4, inherit.aes = FALSE) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6)) +
+  ylab('%')+
+  xlab('')+
+  facet_wrap(~nice_crime_names, scales = 'free_y',ncol = 2)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 28),  
+        axis.title.y = element_text(size = 36), 
+        axis.text.y = element_text(size = 28),
+        strip.background = element_blank(), 
+        strip.text = element_text(face = 'bold', size = 32),
+        panel.spacing.x = unit(0.5, "lines"), 
+        panel.spacing.y = unit(0.5, "lines"), 
+        plot.margin = unit(c(0.5, 1, 0.5, 0.5), "cm"))
+
+ggsave(filename = 'visuals/panel_3_gg.png', panel_3, width = 17, height = 23)
+
+panel_4= ggplot(data = panel_2_df, aes(x = month, y = perc_change, group = nice_crime_names))+
+  geom_line(colour = "#440154", size = 2)+
+    geom_vline(data = vertical_lines_df, aes(xintercept = dates), colour = "gray25", linetype = "solid", size = 0.8) +
+  #geom_ribbon(aes(ymin = perc_change_upper, ymax = perc_change_lower),alpha = 0.2)+
+  scale_x_date(breaks = date_breaks, date_labels = "%b %y", 
+               limits = c(as.Date("2020-03-01"), max(results_df$month)), 
+               expand = c(0.01, 0.01)) +
+  geom_rect(data=lockdown_periods, aes(xmin=start, xmax=end, ymin=-Inf, ymax=Inf), 
+            fill="grey65", alpha=0.4, inherit.aes = FALSE) +
+  scale_y_continuous(breaks = pretty_breaks(n = 6)) +
+  ylab('%')+
+  xlab('')+
+  facet_wrap(~nice_crime_names, scales = 'free_y',ncol = 2)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 28),  
+        axis.title.y = element_text(size = 36),
+        axis.text.y = element_text(size = 28),
+        strip.background = element_blank(), 
+        strip.text = element_text(face = 'bold', size = 32),
+        panel.spacing.x = unit(0.5, "lines"), 
+        panel.spacing.y = unit(0.5, "lines"), 
+        plot.margin = unit(c(0.5, 1, 0.5, 0.5), "cm"))
+
+ggsave(filename = 'visuals/panel_4_gg.png', panel_4, width = 17, height = 23)
+
+```
+
+#This panels are for crime trend for each crime type starting from March 2015 to Aug 2023
+
+```{r}
+date_breaks_trend <- seq(from = as.Date("2015-03-01"), to = as.Date("2023-03-01"), by = "1 year")
+#date_breaks_trend <- c(date_breaks_trend, as.Date("2023-08-01"))
+
+
+trend_1 <- ggplot(data = trend_1_df, aes(x = month, y = crime_rates, group = nice_crime_names)) +
+  geom_line(size = 2, colour = "#fde725") + 
+  geom_vline(xintercept = as.numeric(as.Date("2020-03-26")), color="gray25", linetype="solid", size=0.8)+
+  theme_bw()+
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 28),
+    axis.text.y = element_text(size = 28),
+    strip.background = element_blank(),
+    strip.text = element_text(face = 'bold', size = 32),
+    panel.spacing.x = unit(0.5, "lines"), 
+    panel.spacing.y = unit(0.5, "lines"), 
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "cm")
+  ) +
+  scale_x_date(breaks = date_breaks_trend, 
+    date_labels = "%b %y", 
+    limits = c(as.Date("2015-03-01"), as.Date("2023-08-01")), 
+    expand = c(0.01, 0.01))+
+  scale_y_continuous(breaks = pretty_breaks(n = 6)) +
+  scale_color_viridis_d() + # for discrete color scale from viridis
+  labs(y = '', x = '') +
+  facet_wrap(~nice_crime_names, scales = 'free_y', ncol = 2)
+
+ggsave(filename = 'visuals/trend_1_gg.png', trend_1, width = 17, height = 23)
+
+
+trend_2 <- ggplot(data = trend_2_df, aes(x = month, y = crime_rates, group = nice_crime_names)) +
+  geom_line(size = 2, colour = "#fde725") +
+  geom_vline(xintercept = as.numeric(as.Date("2020-03-26")), color="gray25", linetype="solid", size=0.8)+
+  theme_bw()+
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 28),
+    axis.text.y = element_text(size = 28),
+    strip.background = element_blank(),
+    strip.text = element_text(face = 'bold', size = 32),
+    panel.spacing.x = unit(0.5, "lines"), 
+    panel.spacing.y = unit(0.5, "lines"), 
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "cm")
+  ) +
+  scale_x_date(breaks = date_breaks_trend, 
+    date_labels = "%b %y", 
+    limits = c(as.Date("2015-03-01"), as.Date("2023-03-01")), 
+    expand = c(0.01, 0.01))+
+  scale_y_continuous(breaks = pretty_breaks(n = 6)) +
+  scale_color_viridis_d() + # for discrete color scale from viridis
+  labs(y = '', x = '') +
+  facet_wrap(~nice_crime_names, scales = 'free_y', ncol = 2)
+
+ggsave(filename = 'visuals/trend_2_gg.png', trend_2, width = 17, height = 23)
+
+```
+
+#year-on-year analysis
+```{r}
+library(dplyr)
+library(lubridate)
+
+# Filter data for 2019 and for each subsequent year range
+data_2019 <- all_years_data %>% filter(year == 2019)
+data_2020 <- all_years_data %>% filter(month >= as.Date("2020-03-01") & month < as.Date("2021-03-01"))
+data_2021 <- all_years_data %>% filter(month >= as.Date("2021-03-01") & month < as.Date("2022-03-01"))
+data_2022 <- all_years_data %>% filter(month >= as.Date("2022-03-01") & month < as.Date("2023-03-01"))
+data_2023 <- all_years_data %>% filter(month >= as.Date("2023-03-01"))
+
+# Calculate the percentage difference function
+calculate_percentage_difference <- function(data_base, data_compare) {
+  # Make sure we're comparing the same months in the year
+  data_base <- data_base %>% mutate(month_num = month(month))
+  data_compare <- data_compare %>% mutate(month_num = month(month))
+
+  # Join the data frames by crime_type and month_num
+  joined_data <- inner_join(data_base, data_compare, by = c("crime_type", "month_num"), suffix = c("_base", "_compare"))
+
+  # Calculate the percentage difference
+  joined_data <- joined_data %>%
+    mutate(percentage_diff = (crime_rates_compare - crime_rates_base) / crime_rates_base * 100)
+
+  return(joined_data)
+}
+
+# Now calculate the percentage differences for each year
+percentage_diffs_20_19 <- calculate_percentage_difference(data_2019, data_2020)
+percentage_diffs_21_19 <- calculate_percentage_difference(data_2019, data_2021)
+percentage_diffs_22_19 <- calculate_percentage_difference(data_2019, data_2022)
+percentage_diffs_23_19 <- calculate_percentage_difference(data_2019, data_2023)
+
+# Combine the results into a single data frame
+percentage_diffs <- bind_rows(
+  percentage_diffs_20_19 %>% mutate(year_comparison = "2020-2019"),
+  percentage_diffs_21_19 %>% mutate(year_comparison = "2021-2019"),
+  percentage_diffs_22_19 %>% mutate(year_comparison = "2022-2019"),
+  percentage_diffs_23_19 %>% mutate(year_comparison = "2023-2019")
+)
+
+# View the combined percentage differences
+print(percentage_diffs)
+
+```
+
+#year-on-year graphs
+```{r}
+
+# Filter total counts data and draw line graph showing total crime numbers for each year
+raw_counts_data <- all_years_data %>%
+  group_by(month, year = as.numeric(year)) %>%
+  mutate(month_num = month(month)) %>% 
+  filter(year %in% 2019:2023) %>% 
+  filter(!(year == 2023 & month_num == 9))
+
+raw_counts_data$year <- factor(raw_counts_data$year)
+
+raw_counts_data_1 <- raw_counts_data[raw_counts_data$crime_type %in% panel_1_crimes, ]
+raw_counts_data_2 <- raw_counts_data[!raw_counts_data$crime_type %in% panel_1_crimes, ]
+
+raw_counts_data_1 <- raw_counts_data_1 %>%
+  mutate(nice_crime_names = recode(crime_type,
+    "Theft from the person" = 'Theft Person',
+    "Robbery" = "Robbery",
+    "Shoplifting" = "Shoplifting",
+    "Other theft" = 'Other Theft',
+    "Vehicle crime" = 'Vehicle Crime',
+    "Criminal damage and arson" = 'Damage & Arson',
+    "Bicycle theft" = 'Bike Theft',
+    "Burglary" = "Burglary",
+    .default = crime_type
+  ))
+desired_order <- c('Theft Person', "Robbery", "Shoplifting", 'Other Theft', "Burglary", 'Vehicle Crime', 'Damage & Arson', "Bike Theft")
+                   
+raw_counts_data_1$nice_crime_names <- factor(raw_counts_data_1$nice_crime_names, levels = desired_order)
+
+#yoy 2 
+
+raw_counts_data_2 <- raw_counts_data_2 %>%
+  mutate(nice_crime_names = recode(crime_type,
+    "Anti-social behaviour" = 'ASB',
+    "Drugs" = "Drugs",
+    "Other crime" = 'Other Crime',
+    "Possession of weapons" = 'Weapon Possession',
+    "Public order" = 'Public Order',
+    "Violence and sexual offences" = 'Violence & Sex Offences',
+    .default = crime_type  
+  ))
+
+desired_order_2 <- c('Violence & Sex Offences',"Public Order", "Weapon Possession","ASB","Drugs", "Other Crime")
+
+raw_counts_data_2$nice_crime_names <- factor(raw_counts_data_2$nice_crime_names, levels = desired_order_2)
+
+# Plotting raw counts
+raw_counts_1 <- ggplot(raw_counts_data_1, aes(x = month_num, y = crime_rates, group = , colour = year, linetype = year)) +
+  theme_bw()+
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 28),
+    axis.text.y = element_text(size = 28),
+    strip.background = element_blank(),
+    strip.text = element_text(face = 'bold', size = 32),
+    panel.spacing.x = unit(0.5, "lines"), 
+    panel.spacing.y = unit(0.5, "lines"), 
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "cm"),
+    legend.text = element_text(size = 24),
+    legend.title = element_text(size = 24)
+  ) +
+  facet_wrap(~ nice_crime_names, ncol = 2, scales = "free_y") +
+  geom_line(size = 0.8) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  scale_color_manual(values = c("2019" = "black", "2020" = "grey60", "2021" = "grey33", "2022" = "grey18", "2023" = "black")) +
+  scale_linetype_manual(values = c("2019" = "solid", "2020" = "dashed", "2021" = "dotted", "2022" = "dashed", "2023" = "dotted")) +
+  labs(x = NULL, y = NULL, colour = "Year", linetype = "Year")
+
+ggsave(filename = 'visuals/raw_counts_1.png', raw_counts_1, width = 17, height = 23)
+
+raw_counts_2 <- ggplot(raw_counts_data_2, aes(x = month_num, y = crime_rates, group = , colour = year, linetype = year)) +
+  theme_bw()+
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 28),
+    axis.text.y = element_text(size = 28),
+    strip.background = element_blank(),
+    strip.text = element_text(face = 'bold', size = 32),
+    panel.spacing.x = unit(0.5, "lines"), 
+    panel.spacing.y = unit(0.5, "lines"), 
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "cm"),
+    legend.text = element_text(size = 24),
+    legend.title = element_text(size = 24)
+  ) +
+  facet_wrap(~ nice_crime_names, ncol = 2, scales = "free_y") +
+  geom_line(size = 0.8) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  scale_color_manual(values = c("2019" = "black", "2020" = "grey60", "2021" = "grey33", "2022" = "grey18", "2023" = "black")) +
+  scale_linetype_manual(values = c("2019" = "solid", "2020" = "dashed", "2021" = "dotted", "2022" = "dashed", "2023" = "dotted")) +
+  labs(x = NULL, y = NULL, colour = "Year", linetype = "Year", size = 24)
+
+ggsave(filename = 'visuals/raw_counts_2.png', raw_counts_2, width = 17, height = 23)
+
+# Panel 1 crimes for arima plots
+percentage_diffs_1 <- percentage_diffs[percentage_diffs$crime_type %in% panel_1_crimes, ]
+percentage_diffs_2 <- percentage_diffs[!percentage_diffs$crime_type %in% panel_1_crimes, ]
+
+percentage_diffs_1 <- percentage_diffs_1 %>%
+  mutate(nice_crime_names = recode(crime_type,
+    "Theft from the person" = 'Theft Person',
+    "Robbery" = "Robbery",
+    "Shoplifting" = "Shoplifting",
+    "Other theft" = 'Other Theft',
+    "Vehicle crime" = 'Vehicle Crime',
+    "Criminal damage and arson" = 'Damage & Arson',
+    "Bicycle theft" = 'Bike Theft',
+    "Burglary" = "Burglary",
+    .default = crime_type
+  ))
+desired_order <- c('Theft Person', "Robbery", "Shoplifting", 'Other Theft', "Burglary", 'Vehicle Crime', 'Damage & Arson', "Bike Theft")
+                   
+percentage_diffs_1$nice_crime_names <- factor(percentage_diffs_1$nice_crime_names, levels = desired_order)
+
+#yoy 2 
+
+percentage_diffs_2 <- percentage_diffs_2 %>%
+  mutate(nice_crime_names = recode(crime_type,
+    "Anti-social behaviour" = 'ASB',
+    "Drugs" = "Drugs",
+    "Other crime" = 'Other Crime',
+    "Possession of weapons" = 'Weapon Possession',
+    "Public order" = 'Public Order',
+    "Violence and sexual offences" = 'Violence & Sex Offences',
+    .default = crime_type  
+  ))
+
+desired_order_2 <- c('Violence & Sex Offences',"Public Order", "Weapon Possession","ASB","Drugs", "Other Crime")
+
+percentage_diffs_2$nice_crime_names <- factor(percentage_diffs_2$nice_crime_names, levels = desired_order_2)
+
+# Convert 'month_num' to actual 'Date' objects for better x-axis labeling
+percentage_diffs_1 <- percentage_diffs_1 %>%
+  mutate(month_label = as.Date(paste(month_base, month_num, "01", sep = "-")))
+
+percentage_diffs_2 <- percentage_diffs_2 %>%
+  mutate(month_label = as.Date(paste(month_base, month_num, "01", sep = "-")))
+
+# Plot the line graph
+percentage_diffs_1_plot <- ggplot(percentage_diffs_1, aes(x = month_label, y = percentage_diff, group = year_comparison, colour = year_comparison, linetype = year_comparison)) +
+  geom_line(size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "black", size = 0.8) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 28),
+    axis.text.y = element_text(size = 28),
+    strip.background = element_blank(),
+    strip.text = element_text(face = 'bold', size = 32),
+    panel.spacing.x = unit(0.5, "lines"),
+    panel.spacing.y = unit(0.5, "lines"),
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "cm"),
+    legend.text = element_text(size = 24),
+    legend.title = element_text(size = 24)
+  ) +
+  facet_wrap(~ nice_crime_names, ncol = 2, scales = "free_y") +
+  scale_color_manual(values = c("2020-2019" = "grey60", "2021-2019" = "grey33", "2022-2019" = "grey18", "2023-2019" = "black")) +
+  scale_linetype_manual(values = c("2020-2019" = "dashed", "2021-2019" = "dotted", "2022-2019" = "dashed", "2023-2019" = "dotted")) +
+  labs(x = NULL, y = "", colour = "Year Comparison", linetype = "Year Comparison")
+
+ggsave(filename = 'visuals/percentage_diffs_1_plot.png', percentage_diffs_1_plot, width = 17, height = 23)
+
+percentage_diffs_2_plot <- ggplot(percentage_diffs_2, aes(x = month_label, y = percentage_diff, group = year_comparison, colour = year_comparison, linetype = year_comparison)) +
+  geom_line(size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "black", size = 0.8) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 28),
+    axis.text.y = element_text(size = 28),
+    strip.background = element_blank(),
+    strip.text = element_text(face = 'bold', size = 32),
+    panel.spacing.x = unit(0.5, "lines"),
+    panel.spacing.y = unit(0.5, "lines"),
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "cm"),
+    legend.text = element_text(size = 24),
+    legend.title = element_text(size = 24)
+  ) +
+  facet_wrap(~ nice_crime_names, ncol = 2, scales = "free_y") +
+  scale_color_manual(values = c("2020-2019" = "grey60", "2021-2019" = "grey33", "2022-2019" = "grey18", "2023-2019" = "black")) +
+  scale_linetype_manual(values = c("2020-2019" = "dashed", "2021-2019" = "dotted", "2022-2019" = "dashed", "2023-2019" = "dotted")) +
+  labs(x = NULL, y = "", colour = "Year Comparison", linetype = "Year Comparison")
+
+ggsave(filename = 'visuals/percentage_diffs_2_plot.png', percentage_diffs_2_plot, width = 17, height = 23)
+
+```
+
+
+```{r}
+pd_plot= ggplot(data = results_df, aes(x = month, y = perc_change, group = nice_crime_names))+
+  geom_line(colour = 'orange', size = 1.5)+
+  geom_ribbon(aes(ymin = perc_change_upper, ymax = perc_change_lower),alpha = 0.2)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1 , hjust = 1))+
+  theme(text = element_text(size = 18))+
+  scale_x_date(date_breaks = "4 months", date_labels = "%b %y")+
+  ylab('')+
+  xlab('')+
+  facet_wrap(~nice_crime_names, scales = 'free_y',ncol = 2)+
+  theme(strip.background = element_blank(), strip.text = element_text(face = 'bold'))
+
+ggsave(filename = 'visuals/panel_pc_jn23_gg.png', pd_plot, width = 15, height = 20)
+```
+
+```{r}
+panel3 <- results_df %>%  mutate(nice_crime_names_arima = recode(crime_type, "Anti-social behaviour" = 'ASB (1,1,0)(1,1,0)',
+                                  "Drugs" = "Drugs (0,1,2)(1,0,0)",
+                                  "Bicycle theft"  = 'Bike Theft (0,1,0)(0,1,1)',
+                                  "Burglary" = "Burglary (0,1,1)(1,1,0)",
+                                  "Criminal damage and arson"  = 'Damage & Arson (0,1,1)(0,1,1)',
+                                  "Other crime" = 'Other Crime (0,1,1)(0,1,1)',
+                                  "Other theft"= 'Other Theft (3,1,0)(1,1,0)',
+                                  "Possession of weapons" = 'Weapon Possession (0,1,1)(1,1,0)',
+                                  "Public order"  = 'Public Order (0,1,0)(0,1,1)',
+                                  "Theft from the person" = 'Theft Person (1,0,0)(1,1,)',
+                                  "Violence and sexual offences"= 'Violence & Sex Offences (1,0,0)(0,1,1) with drift',
+                                  'Vehicle crime' = 'Vehicle Crime (1,1,0)(1,1,0)',
+                                  "Robbery" = "Robbery (0,1,1)(1,0,0)",
+                                  "Shoplifting" = "Shoplifting (2,1,0)(1,1,0)",
+                                  .default = crime_type ))
+
+
+
+desired_order <- c("Other Theft (3,1,0)(1,1,0)", "Robbery (0,1,1)(1,0,0)",  "Shoplifting (2,1,0)(1,1,0)",
+                  "Theft Person (1,0,0)(1,1,)" , "Bike Theft (0,1,0)(0,1,1)", "Burglary (0,1,1)(1,1,0)",
+                   "Damage & Arson (0,1,1)(0,1,1)", "Vehicle Crime (1,1,0)(1,1,0)", 
+                   "Public Order (0,1,0)(0,1,1)", "Violence & Sex Offences (1,0,0)(0,1,1) with drift",
+                   "Weapon Possession (0,1,1)(1,1,0)", "ASB (1,1,0)(1,1,0)",
+                   "Drugs (0,1,2)(1,0,0)", "Other Crime (0,1,1)(0,1,1)")
+
+                   
+                   
+                   
+
+panel3$nice_crime_names_arima <- factor(panel3$nice_crime_names_arima, levels = desired_order)
+
+# Create a dataframe for lockdown periods
+lockdown_periods <- data.frame(
+  start = as.Date(c("2020-03-16", "2020-11-05", "2021-01-06")),
+  end = as.Date(c("2020-06-01", "2020-12-02", "2021-03-10"))
+)
+
+paper_arima= ggplot(data = panel3, aes(x = month, y = crime_rates, group = nice_crime_names))+
+  geom_line(colour = 'darkblue', size = 1.5)+
+  geom_line(aes(y = fitted), linetype = 'dotted')+
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95),alpha = 0.2)+
+  theme_bw()+
+  geom_rect(data=lockdown_periods, aes(xmin=start, xmax=end, ymin=-Inf, ymax=Inf), 
+            fill="grey", alpha=0.4, inherit.aes = FALSE) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1 , hjust = 1))+
+  theme(text = element_text(size = 18))+
+  scale_x_date(breaks = date_breaks, date_labels = "%b %y", 
+               limits = c(as.Date("2020-03-01"), max(results_df$month)), 
+               expand = c(0.01, 0.01)) +
+  scale_y_continuous(expand = expansion(mult = c(0.10, 0.15))) +
+  ylab('')+
+  xlab('')+
+  facet_wrap(~nice_crime_names_arima, scales = 'free_y',ncol = 2)+
+  theme(
+    strip.background = element_blank(), 
+    strip.text = element_text(face = 'bold'),
+    panel.spacing.x = unit(0.5, "lines"), 
+    panel.spacing.y = unit(0.5, "lines"),  
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "cm")) 
+
+ggsave(filename = '/Users/hulyaseyidoglu/Library/CloudStorage/OneDrive-UniversityofLeeds/PhD Materials/Time-Series/JPS/Time-Series Workshop/visuals/paper/paper_arima.png', width = 15, height = 20)
+
+```
+
